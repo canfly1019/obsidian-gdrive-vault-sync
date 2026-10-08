@@ -9,7 +9,10 @@
 		"dev": "node esbuild.config.mjs",
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
 		"version": "node version-bump.mjs && git add manifest.json versions.json",
-		"lint": "eslint ."
+		"lint": "eslint .",
+		"test": "node --test test/*.test.mjs",
+		"check": "npm run build && npm test && npm run lint:regressions",
+		"lint:regressions": "node scripts/lint-regressions.mjs"
 	},
 	"keywords": [],
 	"license": "0-BSD",
