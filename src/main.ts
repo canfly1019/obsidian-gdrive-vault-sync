@@ -1,23 +1,41 @@
-import { App, Plugin, Notice } from 'obsidian';
+import { Plugin, Notice, Platform } from 'obsidian';
 import { DEFAULT_SETTINGS, ObsidianGDriveSyncSettings } from './types';
 import { ObsidianGDriveSyncSettingTab } from './ui/SettingsTab';
 import { GoogleAuth } from './auth/GoogleAuth';
 import { GoogleDriveStorage } from './storage/GoogleDriveStorage';
 import { SyncEngine } from './sync/SyncEngine';
+import { VersioningEngine } from './sync/VersioningEngine';
+
+// Keep the vault lock through plugin reloads, while an older operation finishes.
+const lockKey = Symbol.for('obsidian-gdrive-vault-sync.active-operations');
+const registry = globalThis as typeof globalThis & { [lockKey]?: WeakMap<object, Promise<void>> };
+const activeOperations = registry[lockKey] ??= new WeakMap<object, Promise<void>>();
 
 export default class ObsidianGDriveSyncPlugin extends Plugin {
 	settings: ObsidianGDriveSyncSettings;
 	public syncEngine: SyncEngine | null = null;
-	public statusBarItemEl: HTMLElement;
+	public statusBarItemEl: HTMLElement | undefined;
+	private versioning: VersioningEngine;
+	private unloaded = false;
 
 	async onload() {
+		this.unloaded = false;
 		await this.loadSettings();
+		if (this.unloaded) return;
+		this.versioning = new VersioningEngine(this.app);
+		this.registerEvent(this.app.vault.on('modify', file => this.versioning.invalidate(file.path)));
+		this.registerEvent(this.app.vault.on('create', file => this.versioning.invalidate(file.path)));
+		this.registerEvent(this.app.vault.on('delete', file => this.versioning.invalidate(file.path)));
+		this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+			this.versioning.invalidate(oldPath);
+			this.versioning.invalidate(file.path);
+		}));
 
 		// This adds a settings tab so the user can configure various aspects of the plugin
 		this.addSettingTab(new ObsidianGDriveSyncSettingTab(this.app, this));
 
 		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		this.statusBarItemEl = this.addStatusBarItem();
+		if (!Platform.isMobile) this.statusBarItemEl = this.addStatusBarItem();
 		this.updateStatusBar();
 
 		// Ribbon Icons for manual operations
@@ -32,7 +50,7 @@ export default class ObsidianGDriveSyncPlugin extends Plugin {
 		// Commands for Command Palette
 		this.addCommand({
 			id: 'push-google-drive',
-			name: 'Push Now',
+			name: 'Push now',
 			callback: async () => {
 				await this.runPush();
 			}
@@ -40,7 +58,7 @@ export default class ObsidianGDriveSyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: 'pull-google-drive',
-			name: 'Pull Now',
+			name: 'Pull now',
 			callback: async () => {
 				await this.runPull();
 			}
@@ -48,7 +66,7 @@ export default class ObsidianGDriveSyncPlugin extends Plugin {
 
 		this.addCommand({
 			id: 'sync-google-drive',
-			name: 'Sync Now (Full)',
+			name: 'Sync now (full)',
 			callback: async () => {
 				await this.runSync();
 			}
@@ -59,15 +77,14 @@ export default class ObsidianGDriveSyncPlugin extends Plugin {
 		if (this.settings.syncMode === 'onOpenClose') {
 			// Trigger a sync when app is fully loaded
 			this.app.workspace.onLayoutReady(() => {
-				this.runSync();
+				if (!this.unloaded) void this.runSync();
 			});
 		}
 	}
 
 	onunload() {
-		if (this.settings.syncMode === 'onOpenClose') {
-			// Can't reliably async sync on unload, but attempt it if needed
-		}
+		this.unloaded = true;
+		this.clearInterval();
 	}
 
 	async loadSettings() {
@@ -75,15 +92,16 @@ export default class ObsidianGDriveSyncPlugin extends Plugin {
 	}
 
 	async saveSettings() {
+		if (this.unloaded) return;
 		await this.saveData(this.settings);
 		this.updateStatusBar();
 	}
 
-	// Stubs to satisfy type checker in SettingsTab
+	// SettingsTab exposes the active operation and schedule.
 	public syncIntervalId: number | undefined = undefined;
 	public isSyncing: boolean = false;
 	public triggerSync() {
-		this.runSync();
+		void this.runSync();
 	}
 
 	private initSyncEngine() {
@@ -92,85 +110,93 @@ export default class ObsidianGDriveSyncPlugin extends Plugin {
 			return false;
 		}
 
-		const auth = new GoogleAuth(this.settings, async () => {
+		const snapshot = { ...this.settings, syncRules: this.settings.syncRules.map(rule => ({ ...rule })),
+			ignoredPaths: [...this.settings.ignoredPaths] };
+		const auth = new GoogleAuth(snapshot, async () => {
+			if (this.unloaded || this.settings.authMode !== snapshot.authMode ||
+				this.settings.clientId !== snapshot.clientId || this.settings.clientSecret !== snapshot.clientSecret ||
+				this.settings.refreshToken !== snapshot.refreshToken ||
+				this.settings.serviceAccountJson !== snapshot.serviceAccountJson) return;
+			this.settings.accessToken = snapshot.accessToken;
+			this.settings.accessTokenExpiry = snapshot.accessTokenExpiry;
 			await this.saveSettings();
 		});
 
 		// Initialize storage
-		const storage = new GoogleDriveStorage(auth, this.settings.driveFolderId);
+		const storage = new GoogleDriveStorage(auth, snapshot.driveFolderId);
 
 		// Initialize engine
 		this.syncEngine = new SyncEngine(
 			this.app,
 			storage,
-			this.settings,
-			(msg) => new Notice(msg, 5000)
+			snapshot,
+			(msg) => new Notice(msg, 5000),
+			this.versioning ??= new VersioningEngine(this.app)
 		);
 
 		return true;
 	}
 
-	public async runSync() {
-		if (!this.initSyncEngine()) return;
-		const notice = new Notice('Starting full sync...', 0);
-		this.statusBarItemEl.setText('Syncing...');
-		try {
-			await this.syncEngine!.sync();
-			notice.hide();
-			new Notice('Full Sync Complete!');
-			this.updateStatusBar();
-		} catch (error) {
-			console.error(error);
-			notice.hide();
-			new Notice('Sync Failed.');
-			this.statusBarItemEl.setText('Sync Failed');
-		}
+	public runSync(): Promise<void> {
+		return this.runOperation('Sync', () => this.syncEngine!.sync());
 	}
 
-	public async runPush(targetPath?: string) {
-		if (!this.initSyncEngine()) return;
-		const notice = new Notice(targetPath ? `Pushing ${targetPath}...` : 'Pushing to Google Drive...', 0);
-		try {
-			await this.syncEngine!.push(targetPath);
-			notice.hide();
-			new Notice(targetPath ? `Pushed ${targetPath}` : 'Push Complete!');
-			this.updateStatusBar();
-		} catch (error) {
-			console.error(error);
-			notice.hide();
-			new Notice('Push Failed.');
-		}
+	public runPush(targetPath?: string): Promise<void> {
+		return this.runOperation('Push', () => this.syncEngine!.push(targetPath));
 	}
 
-	public async runPull(targetPath?: string) {
-		if (!this.initSyncEngine()) return;
-		const notice = new Notice(targetPath ? `Pulling ${targetPath}...` : 'Pulling from Google Drive...', 0);
-		try {
-			await this.syncEngine!.pull(targetPath);
-			notice.hide();
-			new Notice(targetPath ? `Pulled ${targetPath}` : 'Pull Complete!');
-			this.updateStatusBar();
-		} catch (error) {
-			console.error(error);
-			notice.hide();
-			new Notice('Pull Failed.');
-		}
+	public runPull(targetPath?: string): Promise<void> {
+		return this.runOperation('Pull', () => this.syncEngine!.pull(targetPath));
+	}
+
+	private runOperation(label: string, operation: () => Promise<void>): Promise<void> {
+		if (this.unloaded) return Promise.resolve();
+		const active = activeOperations.get(this.app.vault);
+		if (active) return active;
+		// Defer engine initialization until the lock is installed.
+		const task = Promise.resolve().then(async () => {
+			if (this.unloaded || !this.initSyncEngine()) return;
+			const notice = new Notice(`${label} in progress...`, 0);
+			this.statusBarItemEl?.setText('Syncing...');
+			try {
+				await operation();
+				if (!this.unloaded) this.settings.lastSyncTime = Date.now();
+				await this.saveSettings();
+				if (!this.unloaded) new Notice(`${label} complete.`);
+			} catch (error) {
+				console.error(error);
+				if (!this.unloaded) {
+					new Notice(`${label} failed. See the console for details.`);
+					this.statusBarItemEl?.setText('Sync failed');
+				}
+			} finally {
+				notice.hide();
+			}
+		}).finally(() => {
+			if (activeOperations.get(this.app.vault) === task) activeOperations.delete(this.app.vault);
+			this.isSyncing = false;
+		});
+		this.isSyncing = true;
+		activeOperations.set(this.app.vault, task);
+		return task;
+	}
+
+	private clearInterval() {
+		if (this.syncIntervalId !== undefined) window.clearInterval(this.syncIntervalId);
+		this.syncIntervalId = undefined;
 	}
 
 	public configureInterval() {
-		// Clear any existing interval (Obsidian's registerInterval handles cleanup on unload, 
-		// but we might need to clear it manually if settings change - although typically we just let Obsidian handle it or we keep a ref)
-		// For simplicity, we just register a new one. In a real plugin, we'd clear the old one.
-
-		if (this.settings.syncMode === 'interval') {
-			const ms = this.settings.syncIntervalMinutes * 60 * 1000;
-			this.registerInterval(window.setInterval(() => {
-				this.runSync();
-			}, ms));
-		}
+		this.clearInterval();
+		if (this.unloaded || this.settings.syncMode !== 'interval') return;
+		const minutes = this.settings.syncIntervalMinutes;
+		if (!Number.isFinite(minutes) || minutes < 1) return;
+		this.syncIntervalId = window.setInterval(() => { void this.runSync(); }, minutes * 60 * 1000);
+		this.registerInterval(this.syncIntervalId);
 	}
 
 	public updateStatusBar() {
+		if (this.unloaded) return;
 		if (this.settings.lastSyncTime > 0) {
 			const date = new Date(this.settings.lastSyncTime);
 			// Format example: Last Sync: 2/25/2026, 9:25 AM
@@ -178,9 +204,9 @@ export default class ObsidianGDriveSyncPlugin extends Plugin {
 				year: 'numeric', month: 'numeric', day: 'numeric',
 				hour: 'numeric', minute: '2-digit', hour12: true
 			});
-			this.statusBarItemEl.setText(`Last Sync: ${formatter.format(date)}`);
+			this.statusBarItemEl?.setText(`Last Sync: ${formatter.format(date)}`);
 		} else {
-			this.statusBarItemEl.setText('Not synced yet');
+			this.statusBarItemEl?.setText('Not synced yet');
 		}
 	}
 }
