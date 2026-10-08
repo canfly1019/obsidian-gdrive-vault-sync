@@ -1,83 +1,75 @@
 import { App, TFile } from 'obsidian';
 import SparkMD5 from 'spark-md5';
 
-interface HashCacheEntry {
-    md5: string;
-    mtime: number;
-    size: number;
-}
-
-interface HashCache {
-    files: {
-        [path: string]: HashCacheEntry;
-    };
-}
+interface HashCacheEntry { md5: string; mtime: number; size: number; }
+interface HashCache { files: Record<string, HashCacheEntry>; }
 
 export class VersioningEngine {
     private cachePath = '.obsidian-gdrive-cache.json';
     private cache: HashCache = { files: {} };
+    private loaded = false;
+    // Disk cache is only a hint: edits made while Obsidian was closed can preserve stat data.
+    private trusted = new Set<string>();
+    private revisions = new Map<string, number>();
 
     constructor(private app: App) {}
 
+    invalidate(path: string) {
+        for (const key of new Set([...Object.keys(this.cache.files), ...this.revisions.keys(), path])) {
+            if (key === path || key.startsWith(path + '/')) {
+                this.trusted.delete(key);
+                this.revisions.set(key, (this.revisions.get(key) ?? 0) + 1);
+            }
+        }
+    }
+
     async loadCache() {
+        if (this.loaded) return;
+        this.loaded = true;
         try {
             if (await this.app.vault.adapter.exists(this.cachePath)) {
-                const content = await this.app.vault.adapter.read(this.cachePath);
-                this.cache = JSON.parse(content);
+                const value = JSON.parse(await this.app.vault.adapter.read(this.cachePath)) as HashCache;
+                if (value && value.files && typeof value.files === 'object') this.cache = value;
             }
-        } catch (e) {
-            console.error('Failed to load hash cache', e);
+        } catch {
             this.cache = { files: {} };
         }
     }
 
     async saveCache() {
-        try {
-            await this.app.vault.adapter.write(this.cachePath, JSON.stringify(this.cache, null, 2));
-        } catch (e) {
-            console.error('Failed to save hash cache', e);
-        }
+        await this.app.vault.adapter.write(this.cachePath, JSON.stringify(this.cache, null, 2));
     }
 
     async getHash(file: TFile): Promise<string> {
         const entry = this.cache.files[file.path];
-        if (entry && entry.mtime === file.stat.mtime && entry.size === file.stat.size) {
+        if (this.trusted.has(file.path) && entry?.mtime === file.stat.mtime && entry.size === file.stat.size) {
             return entry.md5;
         }
-
-        // Cache miss or file changed
+        const { path } = file;
+        const { mtime, size } = file.stat;
+        const revision = this.revisions.get(path) ?? 0;
         const data = await this.app.vault.readBinary(file);
         const md5 = SparkMD5.ArrayBuffer.hash(data);
-
-        this.cache.files[file.path] = {
-            md5,
-            mtime: file.stat.mtime,
-            size: file.stat.size
-        };
-
+        if (revision !== (this.revisions.get(path) ?? 0) || mtime !== file.stat.mtime || size !== file.stat.size) {
+            throw new Error(`Local file changed while hashing: ${path}. Sync again.`);
+        }
+        this.updateEntry(path, md5, mtime, size);
         return md5;
     }
 
-    /**
-     * Updates the cache for a specific path after a successful sync/download
-     */
     updateEntry(path: string, md5: string, mtime: number, size: number) {
         this.cache.files[path] = { md5, mtime, size };
+        this.trusted.add(path);
     }
 
-    /**
-     * Clears cache for files that no longer exist in the vault
-     */
     async cleanCache(existingPaths: Set<string>) {
-        let changed = false;
         for (const path in this.cache.files) {
             if (!existingPaths.has(path)) {
                 delete this.cache.files[path];
-                changed = true;
+                this.trusted.delete(path);
+                this.revisions.delete(path);
             }
         }
-        if (changed) {
-            await this.saveCache();
-        }
+        await this.saveCache();
     }
 }

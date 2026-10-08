@@ -1,4 +1,4 @@
-export type SyncDirection = 'two-way' | 'download-only';
+export type SyncDirection = 'two-way' | 'upload-only' | 'download-only';
 
 export interface SyncRule {
     localPattern: string;
@@ -52,9 +52,11 @@ export interface FileMeta {
 }
 
 export interface Storage {
+    forRoot?(folderId: string): Storage;
+    rememberPath?(path: string, id: string): void;
     list(path: string): Promise<FileMeta[]>;
     get(path: string): Promise<ArrayBuffer>;
-    put(path: string, data: ArrayBuffer, mimeType?: string): Promise<FileMeta>;
+    put(path: string, data: ArrayBuffer, mimeType?: string, existingId?: string, expectedChecksum?: string): Promise<FileMeta>;
     delete(path: string): Promise<void>;
     mkdir(path: string): Promise<FileMeta>;
 }

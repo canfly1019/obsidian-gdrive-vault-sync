@@ -1,5 +1,9 @@
 import { FileMeta, Storage } from '../types';
 import { GoogleAuth } from '../auth/GoogleAuth';
+import { http } from '../utils/http';
+
+interface DriveFile { id: string; name: string; mimeType: string; modifiedTime: string; size?: string; md5Checksum?: string; parents?: string[]; }
+interface DriveList { files?: DriveFile[]; nextPageToken?: string; }
 
 export class GoogleDriveStorage implements Storage {
     private readonly driveApiBase = 'https://www.googleapis.com/drive/v3/files';
@@ -15,12 +19,24 @@ export class GoogleDriveStorage implements Storage {
         this.pathIdCache.set('/', this.rootFolderId);
     }
 
-    private async fetchWithAuth(url: string, options: RequestInit = {}): Promise<Response> {
+    public rememberPath(path: string, id: string): void {
+        this.pathIdCache.set('/' + path, id);
+    }
+
+    public forRoot(folderId: string): GoogleDriveStorage {
+        return new GoogleDriveStorage(this.auth, folderId);
+    }
+
+    private escapeQuery(value: string): string {
+        return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    }
+
+    private async fetchWithAuth(url: string, options: RequestInit = {}) {
         const token = await this.auth.getAccessToken();
         const headers = new Headers(options.headers || {});
         headers.set('Authorization', `Bearer ${token}`);
 
-        return fetch(url, { ...options, headers });
+        return http(url, { ...options, headers });
     }
 
     /**
@@ -43,18 +59,21 @@ export class GoogleDriveStorage implements Storage {
             }
 
             // Look it up
-            const q = `'${currentParentId}' in parents and name='${part}' and trashed=false`;
-            const url = `${this.driveApiBase}?q=${encodeURIComponent(q)}&fields=files(id,mimeType)`;
+            const q = `'${this.escapeQuery(currentParentId)}' in parents and name='${this.escapeQuery(part)}' and trashed=false`;
+            const url = `${this.driveApiBase}?q=${encodeURIComponent(q)}&supportsAllDrives=true&includeItemsFromAllDrives=true&fields=nextPageToken,files(id,mimeType)`;
             const response = await this.fetchWithAuth(url);
 
             if (!response.ok) {
                 throw new Error(`Failed to resolve path: ${currentPath}`);
             }
 
-            const data = await response.json();
+            const data = await response.json() as DriveList;
 
+            if ((data.files?.length ?? 0) > 1 || data.nextPageToken) {
+                throw new Error(`Duplicate remote path: ${currentPath}`);
+            }
             if (data.files && data.files.length > 0) {
-                currentParentId = data.files[0].id;
+                currentParentId = data.files[0]!.id;
                 this.pathIdCache.set(currentPath, currentParentId);
             } else if (createIfMissing) {
                 // Create folder
@@ -73,7 +92,7 @@ export class GoogleDriveStorage implements Storage {
                     throw new Error(`Failed to create folder: ${currentPath}`);
                 }
 
-                const crData = await crResponse.json();
+                const crData = await crResponse.json() as DriveFile;
                 currentParentId = crData.id;
                 this.pathIdCache.set(currentPath, currentParentId);
             } else {
@@ -94,8 +113,8 @@ export class GoogleDriveStorage implements Storage {
         
         if (!folderId) return []; // Folder does not exist
 
-        const q = `'${folderId}' in parents and trashed=false`;
-        let url = `${this.driveApiBase}?q=${encodeURIComponent(q)}&fields=nextPageToken,files(id,name,mimeType,modifiedTime,size,md5Checksum,parents)&pageSize=1000`;
+        const q = `'${this.escapeQuery(folderId)}' in parents and trashed=false`;
+        let url = `${this.driveApiBase}?q=${encodeURIComponent(q)}&supportsAllDrives=true&includeItemsFromAllDrives=true&fields=nextPageToken,files(id,name,mimeType,modifiedTime,size,md5Checksum,parents)&pageSize=1000`;
 
         let allFiles: FileMeta[] = [];
         let hasNextPage = true;
@@ -106,10 +125,10 @@ export class GoogleDriveStorage implements Storage {
                 throw new Error(`Failed to list files in folder: ${pathOrId}`);
             }
 
-            const data = await response.json();
+            const data = await response.json() as DriveList;
 
             if (data.files) {
-                allFiles = allFiles.concat(data.files.map((f: any) => ({
+                allFiles = allFiles.concat(data.files.map((f: DriveFile) => ({
                     id: f.id,
                     name: f.name,
                     mimeType: f.mimeType,
@@ -121,7 +140,7 @@ export class GoogleDriveStorage implements Storage {
             }
 
             if (data.nextPageToken) {
-                url = `${this.driveApiBase}?q=${encodeURIComponent(q)}&fields=nextPageToken,files(id,name,mimeType,modifiedTime,size,md5Checksum,parents)&pageSize=1000&pageToken=${data.nextPageToken}`;
+                url = `${this.driveApiBase}?q=${encodeURIComponent(q)}&supportsAllDrives=true&includeItemsFromAllDrives=true&fields=nextPageToken,files(id,name,mimeType,modifiedTime,size,md5Checksum,parents)&pageSize=1000&pageToken=${data.nextPageToken}`;
             } else {
                 hasNextPage = false;
             }
@@ -150,72 +169,43 @@ export class GoogleDriveStorage implements Storage {
         return response.arrayBuffer();
     }
 
-    public async put(path: string, data: ArrayBuffer, mimeType: string = 'text/markdown'): Promise<FileMeta> {
-        // We need to resolve the parent's directory first
+    public async put(path: string, data: ArrayBuffer, mimeType = 'text/markdown', existingId?: string, expectedChecksum?: string): Promise<FileMeta> {
         const parts = path.split('/');
         const fileName = parts.pop()!;
-        const parentPath = parts.join('/');
-
-        const parentId = await this.resolvePathToId(parentPath, true);
-        if (!parentId) throw new Error(`Failed to resolve parent directory for upload: ${parentPath}`);
-
-        // Check if file already exists
-        const fileId = await this.resolvePathToId(path);
-
-        let uploadUrl = '';
-        let uploadMethod = '';
-
-        if (!fileId) {
-            uploadUrl = `${this.uploadApiBase}?uploadType=media`;
-            uploadMethod = 'POST';
-        } else {
-            uploadUrl = `${this.uploadApiBase}/${fileId}?uploadType=media`;
-            uploadMethod = 'PATCH';
+        const parentId = await this.resolvePathToId(parts.join('/'), true);
+        if (!parentId) throw new Error('Upload parent folder is missing.');
+        const fileId = existingId || await this.resolvePathToId(path);
+        let etag: string | null = null;
+        if (existingId && expectedChecksum) {
+            const current = await this.fetchWithAuth(`${this.driveApiBase}/${existingId}?supportsAllDrives=true&fields=md5Checksum,trashed`);
+            if (!current.ok) throw new Error('Remote file is no longer available. Sync again.');
+            const info = await current.json() as { md5Checksum?: string; trashed?: boolean };
+            if (info.trashed || info.md5Checksum !== expectedChecksum) throw new Error('Remote file changed before upload. Sync again.');
+            etag = current.headers.get('ETag');
         }
-
-        const response = await this.fetchWithAuth(uploadUrl, {
-            method: uploadMethod,
-            headers: {
-                'Content-Type': mimeType
-            },
-            body: data
+        const fields = 'id,name,mimeType,modifiedTime,size,md5Checksum';
+        const url = fileId
+            ? `${this.uploadApiBase}/${fileId}?uploadType=resumable&supportsAllDrives=true&fields=${fields}`
+            : `${this.uploadApiBase}?uploadType=resumable&supportsAllDrives=true&fields=${fields}`;
+        // Name and parent are submitted together with creation. Existing sanitized names
+        // retain their original Drive name and are updated by the ID from the scan.
+        const response = await this.fetchWithAuth(url, {
+            method: fileId ? 'PATCH' : 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Upload-Content-Type': mimeType, ...(etag ? { 'If-Match': etag } : {}) },
+            body: JSON.stringify(fileId ? {} : { name: fileName, parents: [parentId] })
         });
-
-        if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`Failed to upload media ${path}: ${response.status} ${errText}`);
-        }
-
-        const resData = await response.json();
-        const uploadedFileId = resData.id || fileId;
-
-        // 2) Patch Metadata
-        let metaUrl = `${this.driveApiBase}/${uploadedFileId}`;
-        const metadata: any = { name: fileName };
-        if (!fileId && parentId) {
-            metaUrl += `?addParents=${parentId}`;
-        }
-
-        const metaResponse = await this.fetchWithAuth(metaUrl, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(metadata)
+        const location = response.headers.get('Location');
+        if (!response.ok || !location) throw new Error('Failed to start upload.');
+        const uploadUrl = new URL(location);
+        if (uploadUrl.origin !== 'https://www.googleapis.com') throw new Error('Unexpected upload session URL.');
+        const uploaded = await this.fetchWithAuth(uploadUrl.href, {
+            method: 'PUT', headers: { 'Content-Type': mimeType }, body: data
         });
-
-        if (!metaResponse.ok) {
-            const errText = await metaResponse.text();
-            throw new Error(`Failed to update metadata ${path}: ${metaResponse.status} ${errText}`);
-        }
-
-        const finalMeta = await metaResponse.json();
-        return {
-            id: finalMeta.id,
-            name: finalMeta.name,
-            mimeType: finalMeta.mimeType,
-            modifiedTime: new Date(finalMeta.modifiedTime).getTime(),
-            size: parseInt(finalMeta.size || '0', 10),
-            md5Checksum: finalMeta.md5Checksum
-        };
+        if (!uploaded.ok) throw new Error(`Failed to upload file: ${uploaded.status}`);
+        const meta = await uploaded.json() as DriveFile;
+        return { id: meta.id, name: meta.name, mimeType: meta.mimeType,
+            modifiedTime: new Date(meta.modifiedTime).getTime(), size: Number(meta.size || 0),
+            md5Checksum: meta.md5Checksum };
     }
 
     public async delete(path: string): Promise<void> {
@@ -240,7 +230,7 @@ export class GoogleDriveStorage implements Storage {
         const response = await this.fetchWithAuth(url);
         if (!response.ok) throw new Error(`Failed to get folder meta for: ${path}`);
         
-        const data = await response.json();
+        const data = await response.json() as DriveFile;
         return {
             id: data.id,
             name: data.name,
